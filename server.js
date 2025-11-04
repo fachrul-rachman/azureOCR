@@ -1,37 +1,64 @@
+// server.js
 import express from "express";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
 import axios from "axios";
 import dotenv from "dotenv";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import sharp from "sharp";
+import { pipeline } from "stream";
+import { promisify } from "util";
 
 dotenv.config();
+const pipe = promisify(pipeline);
 
-const ENDPOINT = (process.env.ENDPOINT || "").replace(/\/+$/, "");
-const API_KEY = process.env.API_KEY || "";
-const API_VERSION = process.env.API_VERSION || "2024-07-31";
-const MODEL = process.env.MODEL || "prebuilt-layout";
 const PORT = process.env.PORT || 8080;
-
-// Compression threshold (bytes). Default 10 MB — tweak to taste.
+const API_KEY = process.env.API_KEY || "";
+// endpoint base not used for analyze URL: use ANALYZE_URL or fallback to ENDPOINT + path
+const ANALYZE_URL =
+  process.env.ANALYZE_URL ||
+  `${(process.env.ENDPOINT || "").replace(/\/+$/, "")}/formrecognizer/v2.1/layout/analyze`;
+// max size threshold for attempting compression (bytes). Default 10MB
 const MAX_SIZE_BYTES = parseInt(process.env.MAX_SIZE_BYTES || String(10 * 1024 * 1024), 10);
-// Polling configs
+// Azure upload hard limit (50MB for layout v2.1)
+const AZURE_MAX_BYTES = 50 * 1024 * 1024;
+// Poll configs
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "1000", 10);
 
-if (!ENDPOINT || !API_KEY) {
-  console.error("Please set ENDPOINT and API_KEY in .env");
+if (!ANALYZE_URL || !API_KEY) {
+  console.error("Please set ANALYZE_URL (or ENDPOINT) and API_KEY in environment.");
   process.exit(1);
 }
 
 const app = express();
 app.use(express.json());
 
-const upload = multer({ dest: path.join(process.cwd(), "uploads"), limits: { fileSize: 60 * 1024 * 1024 } }); // temp limit 60MB
+// uploads temp dir
+const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
 
-// simple sentence splitter
+// Multer: allow uploads up to a reasonable hard cap (e.g. 60MB). We'll enforce MAX_SIZE_BYTES policy after upload.
+const multerLimits = { fileSize: 60 * 1024 * 1024 };
+const upload = multer({ dest: UPLOAD_DIR, limits: multerLimits });
+
+// startup: detect Ghostscript once
+let GS_CMD = null;
+try {
+  execSync("gs -v", { stdio: "ignore" });
+  GS_CMD = "gs";
+} catch (e1) {
+  try {
+    execSync("gswin64c -v", { stdio: "ignore" });
+    GS_CMD = "gswin64c";
+  } catch (e2) {
+    GS_CMD = null;
+    console.warn("Ghostscript not found at startup. PDF compression path will be disabled.");
+  }
+}
+
+// simple sentence splitter (compatible with Node's regex engines)
 function splitIntoSentences(text) {
   if (!text) return [];
   return text
@@ -39,30 +66,42 @@ function splitIntoSentences(text) {
     .replace(/\n/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .split(/(?<=[\.!\?])\s+/g)
+    .split(/([.?!])\s+/g) // split by punctuation but keep them
+    .reduce((acc, chunk, idx, arr) => {
+      if (/[.?!]/.test(chunk) && acc.length) {
+        acc[acc.length - 1] += chunk;
+      } else if (chunk.trim()) {
+        acc.push(chunk.trim());
+      }
+      return acc;
+    }, [])
     .map(s => s.trim())
     .filter(Boolean);
 }
 
-// compress PDF using Ghostscript (command-line). Returns path to compressed file.
-// Requires `gs` or `gswin64c` available in PATH.
-function compressPdfWithGhostscript(inputPath, outPath) {
-  // choose executable name
-  const gsCmd = (() => {
-    try {
-      execSync("gs -v", { stdio: "ignore" });
-      return "gs";
-    } catch (e) {
-      try {
-        execSync("gswin64c -v", { stdio: "ignore" });
-        return "gswin64c";
-      } catch (e2) {
-        throw new Error("Ghostscript not found. Install Ghostscript and ensure 'gs' or 'gswin64c' is in PATH.");
-      }
-    }
-  })();
+// compress image using sharp (async)
+async function compressImage(inputPath, outPath) {
+  const img = sharp(inputPath);
+  const meta = await img.metadata();
+  const maxDim = 4000;
+  if ((meta.width && meta.width > maxDim) || (meta.height && meta.height > maxDim)) {
+    await img
+      .resize({
+        width: meta.width > meta.height ? maxDim : null,
+        height: meta.height >= meta.width ? maxDim : null
+      })
+      .jpeg({ quality: 80 })
+      .toFile(outPath);
+  } else {
+    await img.jpeg({ quality: 80 }).toFile(outPath);
+  }
+  return outPath;
+}
 
-  // /screen gives lowest file size (use /ebook or /printer for better quality)
+// compress PDF using Ghostscript via spawn (non-blocking). Returns outPath
+function compressPdfWithGhostscriptSpawn(inputPath, outPath) {
+  if (!GS_CMD) throw new Error("Ghostscript not available on server.");
+  // args array (not joined) for spawn
   const args = [
     "-sDEVICE=pdfwrite",
     "-dCompatibilityLevel=1.4",
@@ -72,155 +111,175 @@ function compressPdfWithGhostscript(inputPath, outPath) {
     "-dBATCH",
     `-sOutputFile=${outPath}`,
     `${inputPath}`
-  ].join(" ");
-
-  execSync(`${gsCmd} ${args}`);
-  return outPath;
-}
-
-// compress image using sharp (resize if large, set quality)
-async function compressImage(inputPath, outPath) {
-  const img = sharp(inputPath);
-  const meta = await img.metadata();
-  // If huge resolution, resize to max 4000px on longest side
-  const maxDim = 4000;
-  if ((meta.width && meta.width > maxDim) || (meta.height && meta.height > maxDim)) {
-    await img.resize({ width: meta.width > meta.height ? maxDim : null, height: meta.height >= meta.width ? maxDim : null }).jpeg({ quality: 80 }).toFile(outPath);
-  } else {
-    // just convert to jpeg with quality to save size
-    await img.jpeg({ quality: 80 }).toFile(outPath);
-  }
-  return outPath;
-}
-
-// try multiple analyze endpoints (modern & legacy); returns operation-location
-async function postAnalyzeCandidateBinary(filePath, contentType) {
-  const candidates = [
-    `${ENDPOINT}/documentModels/${MODEL}:analyze?api-version=${API_VERSION}`,
-    `${ENDPOINT}/formrecognizer/documentModels/${MODEL}:analyze?api-version=${API_VERSION}`,
-    `${ENDPOINT}/formrecognizer/v2.1/layout/analyze`
   ];
-
-  const stat = fs.statSync(filePath);
-  for (const url of candidates) {
-    try {
-      const stream = fs.createReadStream(filePath);
-      const r = await axios.post(url, stream, {
-        headers: {
-          "Ocp-Apim-Subscription-Key": API_KEY,
-          "Content-Type": contentType || "application/pdf",
-          "Content-Length": stat.size
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        validateStatus: s => (s >= 200 && s < 300) || s === 202,
-        timeout: 60000
-      });
-      const op = r.headers["operation-location"] || r.headers["Operation-Location"];
-      if (!op) throw new Error("No operation-location header");
-      return op;
-    } catch (err) {
-      // log but continue trying next candidate
-      // console.log("candidate fail:", url, err?.response?.status, err?.response?.data);
-    }
-  }
-  throw new Error("All analyze endpoints failed (404 or incompatible resource).");
+  return new Promise((resolve, reject) => {
+    const cp = spawn(GS_CMD, args, { stdio: "inherit" });
+    cp.on("error", err => reject(err));
+    cp.on("close", code => {
+      if (code === 0) return resolve(outPath);
+      return reject(new Error(`Ghostscript exited with code ${code}`));
+    });
+  });
 }
 
+// post file to the single analyze endpoint you requested; return operation-location header
+async function postAnalyzeBinary(filePath, contentType) {
+  const stat = await fs.promises.stat(filePath);
+  const stream = fs.createReadStream(filePath);
+
+  const headers = {
+    "Ocp-Apim-Subscription-Key": API_KEY,
+    "Content-Type": contentType || "application/pdf",
+    "Content-Length": stat.size
+  };
+
+  const r = await axios.post(ANALYZE_URL, stream, {
+    headers,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    validateStatus: s => (s >= 200 && s < 300) || s === 202,
+    timeout: 60000
+  });
+
+  const op = r.headers["operation-location"] || r.headers["Operation-Location"] || r.headers["operation_location"];
+  if (!op) throw new Error("Analyze request did not return operation-location header.");
+  return op;
+}
+
+// poll with simple exponential backoff on 429
 async function pollOperation(opUrl) {
   const start = Date.now();
+  let attempt = 0;
   while (true) {
     if (Date.now() - start > TIMEOUT_MS) throw new Error("Timeout polling operation result.");
-    const r = await axios.get(opUrl, { headers: { "Ocp-Apim-Subscription-Key": API_KEY } });
-    const data = r.data;
-    const status = (data.status || "").toLowerCase();
-    if (status === "succeeded") return data;
-    if (status === "failed") throw new Error("Operation failed: " + JSON.stringify(data));
-    await new Promise(rp => setTimeout(rp, POLL_INTERVAL_MS));
+    try {
+      const r = await axios.get(opUrl, { headers: { "Ocp-Apim-Subscription-Key": API_KEY } });
+      const data = r.data;
+      const status = (data.status || "").toLowerCase();
+      if (status === "succeeded") return data;
+      if (status === "failed") throw new Error("Operation failed: " + JSON.stringify(data));
+      // still running
+      await new Promise(rp => setTimeout(rp, POLL_INTERVAL_MS));
+      attempt = 0; // reset retry counter on successful non-429 poll
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 429) {
+        // exponential backoff
+        attempt++;
+        const backoff = Math.min(1000 * 2 ** attempt, 30_000);
+        await new Promise(rp => setTimeout(rp, backoff));
+        continue;
+      }
+      // for other transient http errors, small wait and retry
+      if (status >= 500 && status < 600) {
+        await new Promise(rp => setTimeout(rp, 2000));
+        continue;
+      }
+      throw err;
+    }
   }
 }
 
+// normalize different possible shapes of Azure response into page array { pageNumber, rawText }
 function extractPagesFromAzureResult(data) {
   const analyze = data.analyzeResult || data;
-  const pagesCandidates = analyze.pages || analyze.readResults || analyze.pageResults || analyze.readResults || [];
-  const normalized = (pagesCandidates || []).map(p => {
-    const raw = p.text ?? p.content ?? (Array.isArray(p.lines) ? p.lines.map(l => l.text || l.content).join(" ") : "");
-    return { pageNumber: p.page ?? p.pageNumber ?? p.pageIndex ?? null, rawText: raw };
+  // layout API v2.1 returns "readResults" usually
+  const candidates = analyze.readResults || analyze.pageResults || analyze.pages || analyze.pages || [];
+  const pages = Array.isArray(candidates) ? candidates : [];
+  return pages.map(p => {
+    // readResults has 'text' or lines array
+    let raw = "";
+    if (typeof p.text === "string") raw = p.text;
+    else if (Array.isArray(p.lines)) raw = p.lines.map(l => l.text || l.content || "").join(" ");
+    else if (typeof p.content === "string") raw = p.content;
+    return {
+      pageNumber: p.page || p.pageNumber || p.pageIndex || null,
+      rawText: raw || ""
+    };
   });
-  return normalized;
 }
 
 // main endpoint
 app.post("/analyze", upload.single("file"), async (req, res) => {
   const file = req.file;
-  if (!file) return res.status(400).json({ error: "file is required as multipart/form-data field 'file'" });
+  if (!file) {
+    return res.status(400).json({ error: "file is required as multipart/form-data field 'file'" });
+  }
 
   const origPath = file.path;
   const origName = file.originalname || file.filename;
   const mimeType = file.mimetype || "application/pdf";
-
   let workPath = origPath;
   let compressed = false;
 
   try {
-    const size = fs.statSync(origPath).size;
+    const stat = await fs.promises.stat(origPath);
+    const size = stat.size;
+
+    // If file exceeds configured MAX_SIZE_BYTES, attempt compression
     if (size > MAX_SIZE_BYTES) {
-      // compress
       const ext = path.extname(origName).toLowerCase();
       const outName = `${path.basename(origPath)}-compressed${ext}`;
       const outPath = path.join(path.dirname(origPath), outName);
+
       if (ext === ".pdf") {
-        // try ghostscript
-        try {
-          compressPdfWithGhostscript(origPath, outPath);
-          workPath = outPath;
-          compressed = true;
-        } catch (e) {
-          // if ghostscript missing, fall back: don't compress PDF (warn)
-          console.warn("PDF compress failed or Ghostscript missing:", e.message);
-          // leave workPath as origPath
+        // If GS not available, follow your requested policy: reject large PDF
+        if (!GS_CMD) {
+          throw { status: 413, message: `PDF too large and server has no Ghostscript; cannot accept files > ${Math.round(MAX_SIZE_BYTES / 1024 / 1024)} MB.` };
         }
+        // compress via spawn (non-blocking)
+        await compressPdfWithGhostscriptSpawn(origPath, outPath);
+        workPath = outPath;
+        compressed = true;
       } else if ([".png", ".jpg", ".jpeg", ".tiff", ".tif"].includes(ext)) {
         await compressImage(origPath, outPath);
         workPath = outPath;
         compressed = true;
       } else {
-        // unknown type: skip compression
+        // unknown type; cannot compress — reject
+        throw { status: 415, message: "Unsupported file type for compression" };
       }
     }
 
-    // check file size again (if still too large and > Azure limit, bail)
-    const finalSize = fs.statSync(workPath).size;
-    if (finalSize > 50 * 1024 * 1024) { // Azure limit
-      throw new Error(`File too large after compression: ${Math.round(finalSize / 1024 / 1024)} MB. Azure limit is 50 MB.`);
+    const finalStat = await fs.promises.stat(workPath);
+    if (finalStat.size > AZURE_MAX_BYTES) {
+      throw { status: 413, message: `File too large after compression (${Math.round(finalStat.size / (1024 * 1024))} MB). Azure limit is ${Math.round(AZURE_MAX_BYTES / (1024 * 1024))} MB.` };
     }
 
-    // call Azure (binary)
-    const contentType = mimeType;
-    const operationLocation = await postAnalyzeCandidateBinary(workPath, contentType);
+    // call Azure analyze (binary)
+    const operationLocation = await postAnalyzeBinary(workPath, mimeType);
 
-    // polling
+    // poll until done
     const opResult = await pollOperation(operationLocation);
 
-    // parse pages
-    const pages = extractPagesFromAzureResult(opResult);
-    const pagesOut = pages.map(p => ({ pageNumber: p.pageNumber, rawText: p.rawText, sentences: splitIntoSentences(p.rawText) }));
+    // parse pages => sentences
+    const pagesRaw = extractPagesFromAzureResult(opResult);
+    const pagesOut = pagesRaw.map(p => ({
+      pageNumber: p.pageNumber,
+      rawText: p.rawText,
+      sentences: splitIntoSentences(p.rawText)
+    }));
 
-    // cleanup
-    try { fs.unlinkSync(origPath); } catch (e) {}
+    // cleanup temp files (async)
+    try { await fs.promises.unlink(origPath); } catch (e) { /* ignore */ }
     if (compressed && workPath && workPath !== origPath) {
-      try { fs.unlinkSync(workPath); } catch (e) {}
+      try { await fs.promises.unlink(workPath); } catch (e) { /* ignore */ }
     }
 
     return res.json({ filename: origName, pageCount: pagesOut.length, pages: pagesOut });
   } catch (err) {
-    // cleanup temp files
-    try { fs.unlinkSync(origPath); } catch (e) {}
-    if (workPath && workPath !== origPath) try { fs.unlinkSync(workPath); } catch (e) {}
+    // Cleanup
+    try { await fs.promises.unlink(origPath); } catch (e) { /* ignore */ }
+    if (workPath && workPath !== origPath) try { await fs.promises.unlink(workPath); } catch (e) { /* ignore */ }
 
-    console.error("Analyze error:", err?.response?.data ?? err.message ?? err);
-    return res.status(500).json({ error: err?.response?.data ?? String(err.message ?? err) });
+    // If err has status (we threw it intentionally), respect it
+    if (err && err.status) {
+      return res.status(err.status).json({ error: err.message || String(err) });
+    }
+
+    console.error("Analyze error:", err?.response?.data ?? err?.message ?? err);
+    return res.status(500).json({ error: err?.response?.data ?? String(err?.message ?? err) });
   }
 });
 
-app.listen(PORT, () => console.log(`DocInt simple backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`DocInt backend running on port ${PORT}`));
